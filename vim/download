@@ -1,0 +1,112 @@
+#! /usr/bin/env python
+
+import os
+import sys
+import time
+import serial
+import subprocess
+from optparse import OptionParser
+
+def serial_write(port, data):
+    for char in data:
+        port.write(char)
+        port.flush()
+
+def serial_read(port):
+    try:
+        return port.read()
+    except:
+        print 'Error connecting to device'
+        sys.exit(1)
+
+def wait_for_char(port, char):
+    while True:
+        data = serial_read(port)
+        if data == char:
+            break
+
+def main():
+
+    parser = OptionParser()
+    parser.add_option("-s", "--serial-port",
+                      dest="serialport",
+                      default='/dev/tty.usbserial',
+                      help="choose serial port")
+    parser.add_option("-b", "--baud-rate",
+                      dest="baudrate",
+                      default=9600,
+                      help="specify baud rate")
+    parser.add_option("-n", "--no-tty", action="store_true", dest="no_tty")
+
+    (options, args) = parser.parse_args()
+    
+    if len(args) < 1:
+        print 'Please specify a file to compile and run'
+        sys.exit(1)
+    
+    file = args[0]
+    
+    if not os.path.exists(file):
+        print 'File ' + file + ' not found'
+        sys.exit(1)
+
+    try:
+        port = serial.Serial(options.serialport, baudrate=options.baudrate)
+    except serial.SerialException:
+        print 'Could not connect to serial port %s' % options.serialport
+        print 'Please confirm you device is plugged in and powered on, and the driver is installed'
+        sys.exit(1)
+
+    dirname = "./"
+    filename = file.split(".")[0]+".ihx"
+    pathname = os.path.abspath(os.path.join(dirname, filename))
+    if os.path.exists(pathname):
+        print "cleanup old file"
+        os.remove(pathname)
+
+    sdcc_process = subprocess.Popen(['sdcc', "--xram-loc", " 0x5000",   os.path.abspath(os.path.join("./", file))], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    program, err = sdcc_process.communicate()
+    hexFile = file.split(".")[0]+".ihx"
+
+    if "error" in err or "warning" in err :
+        print 'Compilation Error'
+	print err 
+        sys.exit(1)
+
+
+    while not os.path.exists(pathname):
+	    print "waiting"
+	    time.sleep(1) #block until file exists 
+
+    cat = subprocess.Popen(['cat', hexFile], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    program, err = cat.communicate()
+
+
+    num_lines = len(program.splitlines())
+
+    program = program.replace('\n', '')
+    program = program.replace('\r', '')
+
+    print 'Hit RESET in MON mode to load code'
+
+    wait_for_char(port, '*')
+    serial_write(port, 'DD')
+    wait_for_char(port, '>')
+
+    print 'Downloading Code...'
+
+    serial_write(port, program)
+
+    while True:
+        data = serial_read(port)
+        if data != '.':
+            break
+
+    port.close()
+
+    if not options.no_tty:
+        os.system('clear')
+        os.system('screen %s %s' % (options.serialport, options.baudrate))
+
+if __name__ == "__main__":
+    main()
