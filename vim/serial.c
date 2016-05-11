@@ -1,6 +1,7 @@
 #include <mcs51/8051.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <stdint.h>
 
 //
 //TODO: 
@@ -14,38 +15,188 @@
 //maybe: 
 //backspace works 
 
+//for keyboard 
+volatile int ISRvar;    // ISR counter variable.
+
+volatile uint8_t numBitsSeen; 
+volatile uint8_t message; 
+
+__sbit __at (0xB2) clk; 
+__sbit __at (0xB5) keyboardData; 
+
+volatile __bit messageReady; 
+volatile __bit started; 
+volatile __bit release; 
+volatile __bit shift; 
+
+__xdata __at(0x4000) const unsigned char keymap [200] = 
+   {0, 0, 0, 0, 0, 0, 0, 0,
+   0, 0, 0, 0, 0, 0, '`', 0,
+   0, 0 /*Lalt*/, 0 /*Lshift*/, 0, 0 /*Lctrl*/, 'q', '1', 0,
+   0, 0, 'z', 's', 'a', 'w', '2', 0,
+   0, 'c', 'x', 'd', 'e', '4', '3', 0,
+   0, ' ', 'v', 'f', 't', 'r', '5', 0,
+   0, 'n', 'b', 'h', 'g', 'y', '6', 0,
+   0, 0, 'm', 'j', 'u', '7', '8', 0,
+   0, ',', 'k', 'i', 'o', '0', '9', 0,
+   0, '.', '/', 'l', ';', 'p', '-', 0,
+   0, 0, '\'', 0, '[', '=', 0, 0,
+   0 /*CapsLock*/, 0 /*Rshift*/, 0 /*Enter*/, ']', 0, '\\', 0, 0,
+   0, 0, 0, 0, 0, 0, 0 /*enter*/, 0,
+   0, '1', 0, '4', '7', 0, 0, 0,
+   '0', '.', '2', '5', '6', '8', 0 /*esc*/, 0 /*NumLock*/,
+   0, '+', '3', '-', '*', '9', 0, 0,
+   0, 0, 0, 0 };
+
+
 #define width 16
 #define height 30
 
+__xdata __at (0x4500)  uint8_t volatile maxCol[height]; 
+
 //num rows,num columns 
-extern __xdata __at (0x5000) unsigned char volatile text[height][width]; // = { 0}; //initialize all to null bytes  
+extern __xdata __at (0x5000) unsigned char volatile text[height][width] = {{ 0}}; //initialize all to null bytes  
 __xdata __at (0x5000) unsigned char volatile text[height][width]; // = { 0}; //initialize all to null bytes  
-//char text[height][width]; // = { 0}; //initialize all to null bytes  
 
-extern  int volatile cursorX; 
-int volatile cursorX = 0; 
+extern  uint8_t volatile cursorX; 
+uint8_t volatile cursorX = 0; 
 
-extern int volatile cursorY; 
-int volatile cursorY = 0; 
+extern uint8_t volatile cursorY; 
+uint8_t volatile cursorY = 0; 
 
-extern int volatile maxX; 
-extern int volatile maxY; 
+uint8_t  volatile maxX; 
+uint8_t  volatile maxY; 
 
-extern int volatile normalMode; //if one, in esc, otherwise in insert mode 
+extern uint8_t volatile normalMode; //if one, in esc, otherwise in insert mode 
+uint8_t volatile normalMode = 0; //if one, in esc, otherwise in insert mode 
 
-int volatile maxX = 0; 
-int volatile maxY = 0; 
 
-int volatile normalMode = 0; //if one, in esc, otherwise in insert mode 
+//interrupt for keyboard
+//each time clk goes low, this interrupt will be called 
+void INT_ISR(void) __interrupt (0)
+{
 
- 
-char getchar (void) {
- char c;
- while (!RI); /* wait to receive */
- c = SBUF; /* receive from serial */
- RI = 0;
- return c;
+   //make sure the clk line is low 
+   if( clk != 0 ){
+      P1 = 0x80; //error 
+      return; 
+   }
+
+   if (messageReady) {
+      P1 = 0x81; 
+      //return; //can't take another message yet 
+   } 
+
+   //expecting an 11 bit message 
+   // start=0 data0 data1 ... data7 parityBit stopBit=1 
+   //figure out where we are 
+   if(!started){ //start processing these 11 bits 
+      //look for a start bit on keyboardData- logic 0 
+      started =1; 
+      if (keyboardData == 0){
+         return; //will be processed by next interrupt 
+      } else {
+         //P1 = 0x82; //very bad, should never happen?
+         return; 
+      } 
+   }
+   else if (numBitsSeen < 8){ //haven't gotten all the data 
+      //need to put keyboardData into message[numBitsSeen-1] 
+      //message ^= (-keyboardData ^ message) & (1 << (numBitsSeen-1));
+      if (keyboardData){
+         message |= 1 << (numBitsSeen);
+      } else { //clear bit 
+         message &= ~(1 << (numBitsSeen));
+      } 
+      numBitsSeen++; 
+      return; 
+   } else if (numBitsSeen == 8) {
+         //parity bit 
+      numBitsSeen++; 
+      return; 
+   } else { //Done! message holds the byte- need to check for F0, 
+      started = 0; 
+      numBitsSeen =0; 
+      if(keyboardData == 1){
+         //good stop bit 
+         P1 = 0x03; 
+         numBitsSeen = 0; //get ready for the next message 
+      } else {
+         //P1 = message; 
+         P1 = 0x83; //signal error, start over 
+         //numBitsSeen =0; 
+         //messageReady =0; 
+      } 
+   }
+
+   // press: keycode, release: F0, keycode 
+   // Need to deal with F0 and keycode 
+   if(message == 0xF0){
+      release =1;  
+      message = 0; 
+      return; 
+   } //handle special characters (shift) 
+   else if (message == 0x12){
+      if(release ==0){
+         shift =1; 
+      } else {
+         shift =0; 
+         release = 0; 
+      }  
+      return; 
+   } else { //not a special key 
+      if(release){
+         release =0; 
+      }else{
+         messageReady =1; 
+      }
+   } 
 }
+
+
+void initKeyboard(){
+   numBitsSeen = 0;
+   messageReady = 0; 
+   EX0 = 1;        // Set interrupt.
+   //IT0 = 1;        //transition, not level activated 
+   IT0 = 1; //should be level- on falling level, go to interrupt 
+   EA = 1;            // Set global interrupt.
+   ISRvar = 0; 
+
+   __asm
+      setb P3.5 ;data line high 
+      setb P3.2 ;clock line high  
+      __endasm;
+
+   return; 
+} 
+
+
+//function prototypes; 
+void goToStartOfLine(); 
+
+char keybuff[4]; //holds last 4 keystrokes 
+uint8_t keysInBuffer= 0; 
+
+char getchar(void){
+   unsigned char input; 
+   while (!messageReady)
+   {
+      //wait until a new message appears 
+   }
+   input = message; 
+   messageReady = 0; //let go of lock, can process another message 
+
+   return (keymap[message]); 
+}
+ 
+//char getchar (void) {
+// char c;
+// while (!RI); /* wait to receive */
+// c = SBUF; /* receive from serial */
+// RI = 0;
+// return c;
+//}
  
 void putchar (char c) {
  while (!TI); /* wait end of last transmission */
@@ -134,8 +285,8 @@ void insertChar(char c){
   if ( cursorY > maxY){
      maxY = cursorY ;
   }
-  if ( cursorX > maxX){
-     maxX = cursorX ;
+  if ( cursorX > maxCol[ cursorY]){
+     maxCol[cursorY] = cursorX ;
   }
 }
 
@@ -161,22 +312,48 @@ void d(){
    putchar('K'); 
 }
 
-void backspace(){
-   text[cursorY][cursorX] = 0; 
-   putchar('\0'); //overwrite current position on screen 
-   cursorX--; 
-   if(cursorX < 0){
-      if(cursorY != 0){ //if cursorY is equal to zero, nothing to do 
-         cursorY--;
-         cursorX = -1*cursorX;
-      }
-      else{
-         cursorX = 0; 
-      }
+void printLine(int row){
+   uint8_t i; 
+   uint8_t saveX = cursorX; 
+   saveCursor(); 
+   goToStartOfLine(); 
+   for (i =0; i< maxCol[row]; i++){
+      putchar(text[row][i]); 
    }
-   putchar(8); //backspace
-   putchar(8); //backspace
+   for (i =maxCol[row]; i<width; i++){
+      putchar(' '); 
+   }
+   restoreCursor();
+   cursorX = saveX; 
 }
+
+void backspace(){
+   uint8_t i=0;
+   for(i = cursorX; i< width-1; i++){ //copy everything from cursorX to width into cursorX-1 in text 
+      text[cursorY][i] = text[cursorY][i+1]; 
+   }
+   printLine(cursorY); 
+   text[cursorY][width-1] = ' '; 
+   //TODO: update maxCols- to erase 
+}
+
+//void backspace(){
+//   moveCursor(cursorX-1, cursorY);
+//   putchar(' '); //overwrite current position on screen 
+//   text[cursorY][cursorX] = 0; 
+//   cursorX--; 
+//   if(cursorX < 0){
+//      if(cursorY != 0){ //if cursorY is equal to zero, nothing to do 
+//         cursorY--;
+//         cursorX = -1*cursorX;
+//      }
+//      else{
+//         cursorX = 0; 
+//      }
+//   }
+//   putchar(8); //backspace
+//   putchar(8); //backspace
+//}
 
 //prints to serial until null byte 
 void print(char * inp){
@@ -222,8 +399,8 @@ extern struct cursorPos
 //}
 
 void drawAll(){
-   int i=0; 
-   int j=0; 
+   uint8_t i=0; 
+   uint8_t j=0; 
    saveCursor(); 
    moveCursor("30", "0"); 
    putchar('S'); 
@@ -273,7 +450,7 @@ void goToStartOfLine(){
    char res[10]; 
    sprintf(&res[0], "%d", cursorY+2); //one for status line, one because screen starts at 1
    cursorX = 0; 
-   moveCursor(&res[0] , "0"); //move to beginning of line 
+   moveCursor(&res[0] , "1"); //move to beginning of line 
 }
 
 void normalModeHandler(char direction){
@@ -309,12 +486,14 @@ void normalModeHandler(char direction){
    } 
    else if (direction == 'j'){ //down 
       down(); 
+   } else if (direction == 'x'){
+      backspace(); 
    } 
 }
 
 void updateStatusLine(){
-   int copyY = cursorY;
-   int copyX = cursorX;
+   uint8_t copyY = cursorY;
+   uint8_t copyX = cursorX;
    char resY[10]; 
    char resX[10]; 
    //save cursor on terminal: 
@@ -366,21 +545,21 @@ void handleInput(char c){
 }
 
 void init(){
-   int i=0; 
-   int j=0; 
-   for(j; j< height; j++){
-      for(i; i<width; i++){
+   uint8_t i=0; 
+   uint8_t j=0; 
+   for(j=0; j< height; j++){
+      for(i=0; i<width; i++){
          text[j][i] = '\0'; 
       }
-      i = 0; 
    }
 }
  
 void main() {
    P1 = 0x55; 
  UART_Init();
- //init(); 
+ initKeyboard(); 
  clear(); 
+ init(); //TODO: be careful- we want to be able to load files? 
  updateStatusLine(); 
  crlf(); //make way for status line 
  cursorY = 0; 
@@ -389,6 +568,7 @@ void main() {
  for(;;) {
   char c;
   c = getchar();
+  P1 = c; 
 
   //update the status line: 
   updateStatusLine(); 
